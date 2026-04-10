@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""KiComp - KiCad Component Manager TUI
+
+Browse, add, and update JLCPCB components in your KiCad library.
+3D model preview spins in ASCII. Copy symbol/footprint names to clipboard.
+
+Run in any KiCad project directory that has a lib/ folder.
+
+Keys:
+  j/k or Up/Down  Navigate component list
+  a                Add component by LCSC code
+  u                Update selected component from JLCPCB
+  s                Copy symbol name to clipboard
+  f                Copy footprint name to clipboard
+  q                Quit
+"""
+
+import curses
+import locale
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ── Configuration ──────────────────────────────────────────────
+
+LIB_DIR = Path.cwd() / "lib"
+SYMBOL_LIB = "_JLCPCB"
+FOOTPRINT_LIB = "_JLCPCB"
+SYMBOL_FILE = LIB_DIR / "symbol" / f"{SYMBOL_LIB}.kicad_sym"
+FOOTPRINT_DIR = LIB_DIR / FOOTPRINT_LIB
+PACKAGES3D_DIR = FOOTPRINT_DIR / "packages3d"
+
+SHADE = " .,:;=+*#%@"
+
+
+# ── Library Parsing ────────────────────────────────────────────
+
+def parse_components():
+    """Parse .kicad_sym and return list of component dicts."""
+    if not SYMBOL_FILE.exists():
+        return []
+
+    content = SYMBOL_FILE.read_text()
+    components = []
+
+    # Top-level symbols only (skip sub-symbols like NAME_0_1)
+    all_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
+    top_names = [n for n in all_names if not re.search(r'_\d+_\d+$', n)]
+
+    for name in top_names:
+        marker = f'(symbol "{name}"'
+        idx = content.find(marker)
+        if idx == -1:
+            continue
+
+        # Find matching close paren
+        depth, i = 0, idx
+        while i < len(content):
+            if content[i] == '(':
+                depth += 1
+            elif content[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        sym = content[idx:i + 1]
+
+        comp = {
+            'name': name, 'lcsc': '', 'footprint': '',
+            'reference': 'U', 'pins': 0, 'pin_info': [],
+        }
+
+        for m in re.finditer(r'\(property\s+"(\w+)"\s+"([^"]*)"', sym):
+            key, val = m.group(1), m.group(2)
+            if key == 'Footprint':
+                comp['footprint'] = val
+            elif key == 'LCSC':
+                comp['lcsc'] = val
+            elif key == 'ki_keywords' and not comp['lcsc']:
+                comp['lcsc'] = val
+            elif key == 'Reference':
+                comp['reference'] = val
+
+        pins = []
+        for pm in re.finditer(
+            r'\(pin\s+\w+\s+\w+.*?\(name\s+"([^"]+)".*?\(number\s+"([^"]+)"',
+            sym, re.DOTALL,
+        ):
+            pins.append((pm.group(2), pm.group(1)))
+        pins.sort(key=lambda p: int(p[0]) if p[0].isdigit() else 0)
+        comp['pins'] = len(pins)
+        comp['pin_info'] = pins
+        components.append(comp)
+
+    return components
+
+
+def find_wrl(component):
+    """Locate the .wrl 3D model for a component."""
+    fp = component.get('footprint', '')
+    fp_name = fp.split(':')[1] if ':' in fp else fp
+    if not fp_name:
+        return None
+    path = PACKAGES3D_DIR / f"{fp_name}.wrl"
+    return path if path.exists() else None
+
+
+# ── VRML Parsing ───────────────────────────────────────────────
+
+def parse_wrl(filepath):
+    """Parse VRML 2.0 file -> (vertices, triangle_faces)."""
+    content = Path(filepath).read_text()
+    all_verts, all_faces = [], []
+
+    point_blocks = re.findall(r'point\s*\[(.*?)\]', content, re.DOTALL)
+    coord_blocks = re.findall(r'coordIndex\s*\[(.*?)\]', content, re.DOTALL)
+
+    for pb, cb in zip(point_blocks, coord_blocks):
+        offset = len(all_verts)
+        nums = re.findall(r'[-\d.eE+]+', pb)
+        for i in range(0, len(nums) - 2, 3):
+            try:
+                all_verts.append(
+                    (float(nums[i]), float(nums[i + 1]), float(nums[i + 2]))
+                )
+            except ValueError:
+                pass
+
+        indices = [int(x) for x in re.findall(r'-?\d+', cb)]
+        face = []
+        for idx in indices:
+            if idx == -1:
+                if len(face) >= 3:
+                    for j in range(1, len(face) - 1):
+                        all_faces.append(
+                            (face[0] + offset, face[j] + offset, face[j + 1] + offset)
+                        )
+                face = []
+            else:
+                face.append(idx)
+
+    return all_verts, all_faces
+
+
+# ── 3D ASCII Renderer ─────────────────────────────────────────
+
+class Renderer3D:
+    """Z-buffer triangle rasteriser that outputs ASCII shade characters."""
+
+    def __init__(self, vertices, faces):
+        self.faces = faces
+        self.vertices = self._normalize(vertices)
+
+    @staticmethod
+    def _normalize(verts):
+        if not verts:
+            return []
+        xs, ys, zs = zip(*verts)
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+        cz = (min(zs) + max(zs)) / 2
+        span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1
+        return [
+            ((x - cx) / span * 2, (y - cy) / span * 2, (z - cz) / span * 2)
+            for x, y, z in verts
+        ]
+
+    def render(self, width, height, spin, tilt=0.75):
+        """Return list[str] of *height* rows, each *width* chars wide."""
+        if not self.vertices or not self.faces:
+            return self._empty(width, height)
+
+        cos_s, sin_s = math.cos(spin), math.sin(spin)
+        cos_t, sin_t = math.cos(tilt), math.sin(tilt)
+
+        lx, ly, lz = 0.36, -0.80, 0.48
+        ln = math.sqrt(lx * lx + ly * ly + lz * lz)
+        lx, ly, lz = lx / ln, ly / ln, lz / ln
+
+        xformed = []
+        for x, y, z in self.vertices:
+            x1 = x * cos_s - y * sin_s
+            y1 = x * sin_s + y * cos_s
+            y2 = y1 * cos_t - z * sin_t
+            z2 = y1 * sin_t + z * cos_t
+            xformed.append((x1, y2, z2))
+
+        sy = min(width * 0.22, height * 0.42)
+        sx = sy * 2.0
+
+        zbuf = [[1e9] * width for _ in range(height)]
+        cbuf = [[' '] * width for _ in range(height)]
+        nv = len(xformed)
+
+        for f in self.faces:
+            if f[0] >= nv or f[1] >= nv or f[2] >= nv:
+                continue
+            v0, v1, v2 = xformed[f[0]], xformed[f[1]], xformed[f[2]]
+
+            e1x = v1[0] - v0[0]; e1y = v1[1] - v0[1]; e1z = v1[2] - v0[2]
+            e2x = v2[0] - v0[0]; e2y = v2[1] - v0[1]; e2z = v2[2] - v0[2]
+            nx = e1y * e2z - e1z * e2y
+            ny = e1z * e2x - e1x * e2z
+            nz = e1x * e2y - e1y * e2x
+            nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if nl < 1e-10:
+                continue
+            nx /= nl; ny /= nl; nz /= nl
+
+            if ny > 0:
+                nx, ny, nz = -nx, -ny, -nz
+
+            bright = max(0.08, nx * lx + ny * ly + nz * lz)
+            ci = min(int(bright * (len(SHADE) - 1) + 0.5), len(SHADE) - 1)
+            ch = SHADE[ci]
+
+            hw, hh = width / 2, height / 2
+            p0 = (int(hw + v0[0] * sx), int(hh - v0[2] * sy), v0[1])
+            p1 = (int(hw + v1[0] * sx), int(hh - v1[2] * sy), v1[1])
+            p2 = (int(hw + v2[0] * sx), int(hh - v2[2] * sy), v2[1])
+
+            self._fill(cbuf, zbuf, p0, p1, p2, ch, width, height)
+
+        return [''.join(row) for row in cbuf]
+
+    @staticmethod
+    def _fill(cbuf, zbuf, p0, p1, p2, ch, w, h):
+        pts = sorted((p0, p1, p2), key=lambda p: p[1])
+        (x0, y0, z0), (x1, y1, z1), (x2, y2, z2) = pts
+
+        if y0 == y2:
+            return
+
+        total_dy = float(y2 - y0)
+
+        for y in range(max(0, y0), min(h, y2 + 1)):
+            t_long = (y - y0) / total_dy
+            xa = x0 + t_long * (x2 - x0)
+            za = z0 + t_long * (z2 - z0)
+
+            if y < y1:
+                dy_short = float(y1 - y0) if y1 != y0 else 1.0
+                t = (y - y0) / dy_short
+                xb = x0 + t * (x1 - x0)
+                zb = z0 + t * (z1 - z0)
+            else:
+                dy_short = float(y2 - y1) if y2 != y1 else 1.0
+                t = (y - y1) / dy_short
+                xb = x1 + t * (x2 - x1)
+                zb = z1 + t * (z2 - z1)
+
+            if xa > xb:
+                xa, xb = xb, xa
+                za, zb = zb, za
+
+            ix0 = max(0, int(xa))
+            ix1 = min(w - 1, int(xb))
+            if ix0 > ix1:
+                continue
+
+            dx = xb - xa
+            for x in range(ix0, ix1 + 1):
+                zt = za + (zb - za) * ((x - xa) / dx) if dx > 0.5 else min(za, zb)
+                if zt < zbuf[y][x]:
+                    zbuf[y][x] = zt
+                    cbuf[y][x] = ch
+
+    @staticmethod
+    def _empty(w, h):
+        lines = [' ' * w] * h
+        msg = "No 3D model"
+        if h > 0 and w > len(msg):
+            r = h // 2
+            c = (w - len(msg)) // 2
+            lines[r] = ' ' * c + msg + ' ' * (w - c - len(msg))
+        return lines
+
+
+# ── JLC2KiCadLib wrapper ───────────────────────────────────────
+
+def run_jlc2kicad(lcsc_code):
+    """Download/update a component.  Returns (ok, output_text)."""
+    env = os.environ.copy()
+    env['PYENV_VERSION'] = 'KiCad'
+    cmd = [
+        'JLC2KiCadLib', lcsc_code,
+        '-dir', str(LIB_DIR),
+        '-symbol_lib', SYMBOL_LIB,
+        '-footprint_lib', FOOTPRINT_LIB,
+        '-models', 'STEP', 'WRL',
+    ]
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return False, "Timed out"
+    except FileNotFoundError:
+        return False, "JLC2KiCadLib not found -- is the KiCad pyenv active?"
+
+
+# ── TUI ────────────────────────────────────────────────────────
+
+class KiCompTUI:
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.components = []
+        self.sel = 0
+        self.angle = 0.0
+        self.renderer = None
+        self.spin_start = 0.0
+        self.cached_frame = None
+        self.msg = ""
+        self.msg_time = 0.0
+        self.msg_err = False
+
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(5, curses.COLOR_RED, -1)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+        stdscr.timeout(80)
+
+        self._reload()
+
+    # ── data ──
+
+    def _reload(self):
+        self.components = parse_components()
+        if self.sel >= len(self.components):
+            self.sel = max(0, len(self.components) - 1)
+        self._load_model()
+
+    def _load_model(self):
+        if not self.components:
+            self.renderer = None
+            return
+        wrl = find_wrl(self.components[self.sel])
+        if wrl:
+            try:
+                v, f = parse_wrl(wrl)
+                self.renderer = Renderer3D(v, f)
+            except Exception:
+                self.renderer = None
+        else:
+            self.renderer = None
+        self.spin_start = time.time()
+        self.cached_frame = None
+        self.angle = 0.0
+
+    def _flash(self, text, err=False):
+        self.msg = text
+        self.msg_time = time.time()
+        self.msg_err = err
+
+    # ── drawing ──
+
+    def _safe(self, row, col, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if row < 0 or row >= h or col >= w:
+            return
+        try:
+            self.scr.addnstr(row, col, text, w - col - 1, attr)
+        except curses.error:
+            pass
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        if h < 12 or w < 50:
+            self._safe(0, 0, "Terminal too small (need 50x12)")
+            self.scr.noutrefresh()
+            return
+
+        list_w = max(30, w * 2 // 5)
+        det_col = list_w + 2
+        det_w = w - list_w - 3
+
+        title = f" KiComp   {len(self.components)} component{'s' if len(self.components) != 1 else ''} "
+        self._safe(0, max(0, (w - len(title)) // 2), title,
+                   curses.color_pair(1) | curses.A_BOLD)
+
+        self._safe(1, 0, "\u2500" * w, curses.color_pair(1))
+
+        for r in range(2, h - 2):
+            self._safe(r, list_w, "\u2502", curses.color_pair(1))
+
+        self._draw_list(2, 0, h - 4, list_w)
+        self._draw_details(2, det_col, det_w)
+
+        preview_top = 11
+        preview_h = h - preview_top - 3
+        if preview_h >= 4:
+            self._draw_3d(preview_top, det_col, preview_h, det_w)
+
+        bar = " a:Add  u:Update  s:Copy Symbol  f:Copy Footprint  q:Quit "
+        self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
+
+        if self.msg and time.time() - self.msg_time < 3.0:
+            cp = curses.color_pair(5) if self.msg_err else curses.color_pair(3)
+            self._safe(h - 1, 1, self.msg[:w - 2], cp | curses.A_BOLD)
+
+        self.scr.noutrefresh()
+
+    def _draw_list(self, top, left, height, width):
+        self._safe(top, left + 1, "Components", curses.A_BOLD | curses.A_UNDERLINE)
+
+        if not self.components:
+            self._safe(top + 2, left + 2, "Empty library.", curses.A_DIM)
+            self._safe(top + 3, left + 2, "Press 'a' to add a part.", curses.A_DIM)
+            return
+
+        avail = height - 1
+        n = len(self.components)
+        if n <= avail:
+            start = 0
+        else:
+            start = max(0, min(self.sel - avail // 2, n - avail))
+
+        for i in range(start, min(start + avail, n)):
+            row = top + 1 + (i - start)
+            comp = self.components[i]
+            is_sel = i == self.sel
+            name = comp['name']
+            lcsc = comp.get('lcsc', '')
+
+            max_name = width - 15
+            if len(name) > max_name:
+                name = name[:max_name - 1] + "\u2026"
+
+            arrow = "\u25b6" if is_sel else " "
+            line = f" {arrow} {name}"
+            if lcsc:
+                pad = width - len(line) - len(lcsc) - 1
+                if pad > 0:
+                    line += " " * pad + lcsc
+
+            attr = curses.color_pair(2) | curses.A_BOLD if is_sel else curses.A_NORMAL
+            self._safe(row, left, line[:width], attr)
+
+    def _draw_details(self, top, col, width):
+        if not self.components:
+            return
+        comp = self.components[self.sel]
+
+        self._safe(top, col, "Details", curses.A_BOLD | curses.A_UNDERLINE)
+
+        fields = [
+            ("Name",      comp['name']),
+            ("LCSC",      comp.get('lcsc', '-')),
+            ("Footprint", comp.get('footprint', '-')),
+            ("Type",      comp.get('reference', '-')),
+            ("Pins",      str(comp.get('pins', 0))),
+        ]
+        for i, (label, val) in enumerate(fields):
+            text = f" {label}: {val}"
+            if len(text) > width:
+                text = text[:width - 1] + "\u2026"
+            self._safe(top + 1 + i, col, text)
+
+        pin_info = comp.get('pin_info', [])
+        if pin_info:
+            self._safe(top + 7, col, " Pins:", curses.A_DIM)
+            pin_str = "  ".join(f"{n}:{nm}" for n, nm in pin_info[:6])
+            if len(pin_info) > 6:
+                pin_str += f"  (+{len(pin_info) - 6})"
+            if len(pin_str) > width - 2:
+                pin_str = pin_str[:width - 3] + "\u2026"
+            self._safe(top + 8, col + 1, pin_str, curses.A_DIM)
+
+    def _draw_3d(self, top, col, height, width):
+        self._safe(top, col, "3D Preview", curses.A_BOLD | curses.A_UNDERLINE)
+        pw = min(width, 60)
+        ph = height - 1
+
+        if self.renderer and ph >= 3 and pw >= 10:
+            spinning = (time.time() - self.spin_start) < 60
+            if spinning:
+                lines = self.renderer.render(pw, ph, self.angle)
+                self.cached_frame = lines
+            elif self.cached_frame:
+                lines = self.cached_frame
+            else:
+                lines = self.renderer.render(pw, ph, self.angle)
+                self.cached_frame = lines
+            for i, line in enumerate(lines):
+                self._safe(top + 1 + i, col, line[:width], curses.color_pair(6))
+        else:
+            self._safe(top + ph // 2, col + (width - 14) // 2,
+                       "No 3D model", curses.A_DIM)
+
+    # ── input dialog ──
+
+    def _input_dialog(self, prompt):
+        h, w = self.scr.getmaxyx()
+        bw = min(52, w - 4)
+        bh = 5
+        by = h // 2 - 2
+        bx = (w - bw) // 2
+
+        win = curses.newwin(bh, bw, by, bx)
+        win.bkgd(' ', curses.color_pair(1))
+        win.box()
+        try:
+            win.addnstr(1, 2, prompt, bw - 4)
+            win.addnstr(3, 2, "Enter=OK  Esc=Cancel", bw - 4, curses.A_DIM)
+        except curses.error:
+            pass
+        win.refresh()
+
+        curses.echo()
+        curses.curs_set(1)
+        self.scr.timeout(-1)
+
+        buf = ""
+        while True:
+            try:
+                win.move(2, 2)
+                win.clrtoeol()
+                win.box()
+                win.addnstr(2, 2, buf, bw - 4)
+                win.refresh()
+                ch = win.getch()
+            except curses.error:
+                break
+
+            if ch == 27:
+                buf = ""
+                break
+            elif ch in (10, 13):
+                break
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                buf = buf[:-1]
+            elif 32 <= ch < 127:
+                if len(buf) < bw - 6:
+                    buf += chr(ch)
+
+        curses.noecho()
+        curses.curs_set(0)
+        self.scr.timeout(80)
+        del win
+        self.scr.touchwin()
+        return buf.strip()
+
+    # ── actions ──
+
+    def _add(self):
+        lcsc = self._input_dialog("LCSC Part # (e.g. C17548754):")
+        if not lcsc:
+            return
+        self._flash(f"Downloading {lcsc} ...")
+        self.draw()
+        curses.doupdate()
+
+        ok, out = run_jlc2kicad(lcsc)
+        if ok:
+            self._reload()
+            for i, c in enumerate(self.components):
+                if c.get('lcsc') == lcsc:
+                    self.sel = i
+                    self._load_model()
+                    break
+            self._flash(f"Added {lcsc}")
+        else:
+            self._flash(f"Failed: {out[:60]}", err=True)
+
+    def _update(self):
+        if not self.components:
+            return
+        comp = self.components[self.sel]
+        lcsc = comp.get('lcsc', '')
+        if not lcsc:
+            self._flash("No LCSC code", err=True)
+            return
+        self._flash(f"Updating {comp['name']} ...")
+        self.draw()
+        curses.doupdate()
+
+        ok, out = run_jlc2kicad(lcsc)
+        if ok:
+            self._reload()
+            self._flash(f"Updated {comp['name']}")
+        else:
+            self._flash(f"Failed: {out[:60]}", err=True)
+
+    def _clip(self, text):
+        try:
+            p = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            p.communicate(text.encode())
+            return True
+        except Exception:
+            return False
+
+    def _copy_symbol(self):
+        if not self.components:
+            return
+        comp = self.components[self.sel]
+        ref = f"{SYMBOL_LIB}:{comp['name']}"
+        if self._clip(ref):
+            self._flash(f"Copied: {ref}")
+        else:
+            self._flash("Clipboard failed", err=True)
+
+    def _copy_footprint(self):
+        if not self.components:
+            return
+        comp = self.components[self.sel]
+        fp = comp.get('footprint', '')
+        if not fp:
+            self._flash("No footprint", err=True)
+            return
+        if self._clip(fp):
+            self._flash(f"Copied: {fp}")
+        else:
+            self._flash("Clipboard failed", err=True)
+
+    # ── main loop ──
+
+    def run(self):
+        prev_sel = -1
+        while True:
+            if self.sel != prev_sel:
+                self._load_model()
+                prev_sel = self.sel
+
+            self.draw()
+            curses.doupdate()
+            if (time.time() - self.spin_start) < 60:
+                self.angle += 0.04
+
+            key = self.scr.getch()
+            if key == ord('q'):
+                break
+            elif key in (curses.KEY_UP, ord('k')):
+                if self.components:
+                    self.sel = (self.sel - 1) % len(self.components)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                if self.components:
+                    self.sel = (self.sel + 1) % len(self.components)
+            elif key == ord('a'):
+                self._add()
+            elif key == ord('u'):
+                self._update()
+            elif key == ord('s'):
+                self._copy_symbol()
+            elif key == ord('f'):
+                self._copy_footprint()
+
+
+# ── Entry point ────────────────────────────────────────────────
+
+def main():
+    locale.setlocale(locale.LC_ALL, '')
+    curses.wrapper(lambda stdscr: KiCompTUI(stdscr).run())
+
+
+if __name__ == "__main__":
+    main()
