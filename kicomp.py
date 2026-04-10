@@ -344,14 +344,15 @@ class KiCompTUI:
         curses.init_pair(6, curses.COLOR_MAGENTA, -1)
         stdscr.timeout(80)
 
+        self._quit = False
+
         libs = discover_libraries()
         if len(libs) == 1:
             self.lib_name = libs[0]
             self._reload()
-        elif libs:
-            self._library_menu()
         else:
-            self._library_menu()
+            if self._library_menu() == 'quit':
+                self._quit = True
 
     # ── data ──
 
@@ -430,7 +431,7 @@ class KiCompTUI:
         if preview_h >= 4:
             self._draw_3d(preview_top, det_col, preview_h, det_w)
 
-        bar = " a:Add  u:Update  s:Symbol  f:Footprint  l:Library  q:Quit "
+        bar = " a:Add  u:Update  s:Symbol  f:Footprint  Esc:Libraries  q:Quit "
         self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
 
         if self.msg and time.time() - self.msg_time < 3.0:
@@ -588,13 +589,14 @@ class KiCompTUI:
     # ── library menu ──
 
     def _library_menu(self):
-        """Show library picker. j/k to navigate, Enter to select, n to create new."""
+        """Show library picker. Returns 'quit' to exit program, else None."""
         libs = discover_libraries()
         sel = 0
         if self.lib_name and self.lib_name in libs:
             sel = libs.index(self.lib_name)
 
         self.scr.timeout(-1)
+        result = None
 
         while True:
             self.scr.erase()
@@ -614,13 +616,18 @@ class KiCompTUI:
                     attr = curses.color_pair(2) | curses.A_BOLD if i == sel else curses.A_NORMAL
                     self._safe(3 + i, 2, f" {arrow} {name}", attr)
 
-            bar = " Enter:Select  n:New library  Esc:Back "
+            bar = " Enter:Select  n:New library  Esc:Back  q:Quit "
             self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
 
             self.scr.refresh()
             key = self.scr.getch()
 
-            if key == 27:  # Esc
+            if key == ord('q'):
+                result = 'quit'
+                break
+            elif key == 27:  # Esc
+                if not self.lib_name:
+                    result = 'quit'
                 break
             elif key in (10, 13) and libs:
                 self.lib_name = libs[sel]
@@ -641,7 +648,7 @@ class KiCompTUI:
                     sym_file = sym_dir / f"{name}.kicad_sym"
                     if not sym_file.exists():
                         sym_file.write_text(
-                            f'(kicad_symbol_lib (version 20210201) (generator kicomp)\n)\n'
+                            '(kicad_symbol_lib (version 20210201) (generator kicomp)\n)\n'
                         )
                     libs = discover_libraries()
                     if name in libs:
@@ -649,6 +656,7 @@ class KiCompTUI:
 
         self.scr.timeout(80)
         self.scr.touchwin()
+        return result
 
     # ── actions ──
 
@@ -728,8 +736,8 @@ class KiCompTUI:
     # ── main loop ──
 
     def run(self):
-        if not self.lib_name:
-            self._library_menu()
+        if self._quit:
+            return
 
         prev_sel = -1
         while True:
@@ -745,6 +753,10 @@ class KiCompTUI:
             key = self.scr.getch()
             if key == ord('q'):
                 break
+            elif key == 27:  # Esc → back to library menu
+                if self._library_menu() == 'quit':
+                    break
+                prev_sel = -1
             elif key in (curses.KEY_UP, ord('k')):
                 if self.components:
                     self.sel = (self.sel - 1) % len(self.components)
@@ -760,7 +772,8 @@ class KiCompTUI:
             elif key == ord('f'):
                 self._copy_footprint()
             elif key == ord('l'):
-                self._library_menu()
+                if self._library_menu() == 'quit':
+                    break
                 prev_sel = -1
 
 
