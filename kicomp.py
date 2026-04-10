@@ -19,7 +19,6 @@ Keys:
 import curses
 import locale
 import math
-import os
 import re
 import subprocess
 import time
@@ -299,8 +298,6 @@ class Renderer3D:
 
 def run_jlc2kicad(lcsc_code, lib_name):
     """Download/update a component.  Returns (ok, output_text)."""
-    env = os.environ.copy()
-    env['PYENV_VERSION'] = 'KiCad'
     cmd = [
         'JLC2KiCadLib', lcsc_code,
         '-dir', str(LIB_DIR),
@@ -309,12 +306,12 @@ def run_jlc2kicad(lcsc_code, lib_name):
         '-models', 'STEP', 'WRL',
     ]
     try:
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         return r.returncode == 0, (r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return False, "Timed out"
     except FileNotFoundError:
-        return False, "JLC2KiCadLib not found -- is the KiCad pyenv active?"
+        return False, "JLC2KiCadLib not found"
 
 
 # ── TUI ────────────────────────────────────────────────────────
