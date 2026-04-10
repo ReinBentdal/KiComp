@@ -23,4 +23,5 @@ Run `kicomp` in a KiCad project directory containing a `lib/` folder.
 | `u` | Update selected component |
 | `s` | Copy symbol name |
 | `f` | Copy footprint name |
+| `l` | Switch / create library |
 | `q` | Quit |

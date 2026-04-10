@@ -12,6 +12,7 @@ Keys:
   u                Update selected component from JLCPCB
   s                Copy symbol name to clipboard
   f                Copy footprint name to clipboard
+  l                Switch / create library
   q                Quit
 """
 
@@ -21,33 +22,40 @@ import math
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 # ── Configuration ──────────────────────────────────────────────
 
 LIB_DIR = Path.cwd() / "lib"
-SYMBOL_LIB = "_JLCPCB"
-FOOTPRINT_LIB = "_JLCPCB"
-SYMBOL_FILE = LIB_DIR / "symbol" / f"{SYMBOL_LIB}.kicad_sym"
-FOOTPRINT_DIR = LIB_DIR / FOOTPRINT_LIB
-PACKAGES3D_DIR = FOOTPRINT_DIR / "packages3d"
 
 SHADE = " .,:;=+*#%@"
 
 
+# ── Library discovery ──────────────────────────────────────────
+
+def discover_libraries():
+    """Return sorted list of library names found under lib/symbol/."""
+    sym_dir = LIB_DIR / "symbol"
+    if not sym_dir.is_dir():
+        return []
+    return sorted(p.stem for p in sym_dir.glob("*.kicad_sym"))
+
+
 # ── Library Parsing ────────────────────────────────────────────
 
-def parse_components():
-    """Parse .kicad_sym and return list of component dicts."""
-    if not SYMBOL_FILE.exists():
+def parse_components(lib_name):
+    """Parse .kicad_sym for *lib_name* and return list of component dicts."""
+    sym_file = LIB_DIR / "symbol" / f"{lib_name}.kicad_sym"
+    fp_dir = LIB_DIR / lib_name
+    pkg_dir = fp_dir / "packages3d"
+
+    if not sym_file.exists():
         return []
 
-    content = SYMBOL_FILE.read_text()
+    content = sym_file.read_text()
     components = []
 
-    # Top-level symbols only (skip sub-symbols like NAME_0_1)
     all_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
     top_names = [n for n in all_names if not re.search(r'_\d+_\d+$', n)]
 
@@ -57,7 +65,6 @@ def parse_components():
         if idx == -1:
             continue
 
-        # Find matching close paren
         depth, i = 0, idx
         while i < len(content):
             if content[i] == '(':
@@ -72,6 +79,7 @@ def parse_components():
         comp = {
             'name': name, 'lcsc': '', 'footprint': '',
             'reference': 'U', 'pins': 0, 'pin_info': [],
+            'step': '',
         }
 
         for m in re.finditer(r'\(property\s+"(\w+)"\s+"([^"]*)"', sym):
@@ -84,6 +92,13 @@ def parse_components():
                 comp['lcsc'] = val
             elif key == 'Reference':
                 comp['reference'] = val
+
+        # Find STEP file
+        fp_name = comp['footprint'].split(':')[1] if ':' in comp['footprint'] else comp['footprint']
+        if fp_name and pkg_dir.is_dir():
+            step = pkg_dir / f"{fp_name}.step"
+            if step.exists():
+                comp['step'] = step.name
 
         pins = []
         for pm in re.finditer(
@@ -99,13 +114,13 @@ def parse_components():
     return components
 
 
-def find_wrl(component):
+def find_wrl(component, lib_name):
     """Locate the .wrl 3D model for a component."""
     fp = component.get('footprint', '')
     fp_name = fp.split(':')[1] if ':' in fp else fp
     if not fp_name:
         return None
-    path = PACKAGES3D_DIR / f"{fp_name}.wrl"
+    path = LIB_DIR / lib_name / "packages3d" / f"{fp_name}.wrl"
     return path if path.exists() else None
 
 
@@ -282,15 +297,15 @@ class Renderer3D:
 
 # ── JLC2KiCadLib wrapper ───────────────────────────────────────
 
-def run_jlc2kicad(lcsc_code):
+def run_jlc2kicad(lcsc_code, lib_name):
     """Download/update a component.  Returns (ok, output_text)."""
     env = os.environ.copy()
     env['PYENV_VERSION'] = 'KiCad'
     cmd = [
         'JLC2KiCadLib', lcsc_code,
         '-dir', str(LIB_DIR),
-        '-symbol_lib', SYMBOL_LIB,
-        '-footprint_lib', FOOTPRINT_LIB,
+        '-symbol_lib', lib_name,
+        '-footprint_lib', lib_name,
         '-models', 'STEP', 'WRL',
     ]
     try:
@@ -307,6 +322,7 @@ def run_jlc2kicad(lcsc_code):
 class KiCompTUI:
     def __init__(self, stdscr):
         self.scr = stdscr
+        self.lib_name = None
         self.components = []
         self.sel = 0
         self.angle = 0.0
@@ -328,21 +344,34 @@ class KiCompTUI:
         curses.init_pair(6, curses.COLOR_MAGENTA, -1)
         stdscr.timeout(80)
 
-        self._reload()
+        libs = discover_libraries()
+        if len(libs) == 1:
+            self.lib_name = libs[0]
+            self._reload()
+        elif libs:
+            self._library_menu()
+        else:
+            self._library_menu()
 
     # ── data ──
 
     def _reload(self):
-        self.components = parse_components()
+        if not self.lib_name:
+            self.components = []
+        else:
+            self.components = parse_components(self.lib_name)
         if self.sel >= len(self.components):
             self.sel = max(0, len(self.components) - 1)
         self._load_model()
 
     def _load_model(self):
-        if not self.components:
+        if not self.components or not self.lib_name:
             self.renderer = None
+            self.spin_start = time.time()
+            self.cached_frame = None
+            self.angle = 0.0
             return
-        wrl = find_wrl(self.components[self.sel])
+        wrl = find_wrl(self.components[self.sel], self.lib_name)
         if wrl:
             try:
                 v, f = parse_wrl(wrl)
@@ -383,7 +412,8 @@ class KiCompTUI:
         det_col = list_w + 2
         det_w = w - list_w - 3
 
-        title = f" KiComp   {len(self.components)} component{'s' if len(self.components) != 1 else ''} "
+        lib_label = self.lib_name or "no library"
+        title = f" KiComp [{lib_label}]  {len(self.components)} component{'s' if len(self.components) != 1 else ''} "
         self._safe(0, max(0, (w - len(title)) // 2), title,
                    curses.color_pair(1) | curses.A_BOLD)
 
@@ -395,12 +425,12 @@ class KiCompTUI:
         self._draw_list(2, 0, h - 4, list_w)
         self._draw_details(2, det_col, det_w)
 
-        preview_top = 11
+        preview_top = 12
         preview_h = h - preview_top - 3
         if preview_h >= 4:
             self._draw_3d(preview_top, det_col, preview_h, det_w)
 
-        bar = " a:Add  u:Update  s:Copy Symbol  f:Copy Footprint  q:Quit "
+        bar = " a:Add  u:Update  s:Symbol  f:Footprint  l:Library  q:Quit "
         self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
 
         if self.msg and time.time() - self.msg_time < 3.0:
@@ -411,6 +441,11 @@ class KiCompTUI:
 
     def _draw_list(self, top, left, height, width):
         self._safe(top, left + 1, "Components", curses.A_BOLD | curses.A_UNDERLINE)
+
+        if not self.lib_name:
+            self._safe(top + 2, left + 2, "No library selected.", curses.A_DIM)
+            self._safe(top + 3, left + 2, "Press 'l' to choose one.", curses.A_DIM)
+            return
 
         if not self.components:
             self._safe(top + 2, left + 2, "Empty library.", curses.A_DIM)
@@ -458,6 +493,7 @@ class KiCompTUI:
             ("Footprint", comp.get('footprint', '-')),
             ("Type",      comp.get('reference', '-')),
             ("Pins",      str(comp.get('pins', 0))),
+            ("3D Model",  comp.get('step', '-') or '-'),
         ]
         for i, (label, val) in enumerate(fields):
             text = f" {label}: {val}"
@@ -467,13 +503,13 @@ class KiCompTUI:
 
         pin_info = comp.get('pin_info', [])
         if pin_info:
-            self._safe(top + 7, col, " Pins:", curses.A_DIM)
+            self._safe(top + 8, col, " Pins:", curses.A_DIM)
             pin_str = "  ".join(f"{n}:{nm}" for n, nm in pin_info[:6])
             if len(pin_info) > 6:
                 pin_str += f"  (+{len(pin_info) - 6})"
             if len(pin_str) > width - 2:
                 pin_str = pin_str[:width - 3] + "\u2026"
-            self._safe(top + 8, col + 1, pin_str, curses.A_DIM)
+            self._safe(top + 9, col + 1, pin_str, curses.A_DIM)
 
     def _draw_3d(self, top, col, height, width):
         self._safe(top, col, "3D Preview", curses.A_BOLD | curses.A_UNDERLINE)
@@ -549,9 +585,77 @@ class KiCompTUI:
         self.scr.touchwin()
         return buf.strip()
 
+    # ── library menu ──
+
+    def _library_menu(self):
+        """Show library picker. j/k to navigate, Enter to select, n to create new."""
+        libs = discover_libraries()
+        sel = 0
+        if self.lib_name and self.lib_name in libs:
+            sel = libs.index(self.lib_name)
+
+        self.scr.timeout(-1)
+
+        while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+
+            title = " Libraries "
+            self._safe(0, max(0, (w - len(title)) // 2), title,
+                       curses.color_pair(1) | curses.A_BOLD)
+            self._safe(1, 0, "\u2500" * w, curses.color_pair(1))
+
+            if not libs:
+                self._safe(3, 2, "No libraries found.", curses.A_DIM)
+                self._safe(4, 2, "Press 'n' to create one.", curses.A_DIM)
+            else:
+                for i, name in enumerate(libs):
+                    arrow = "\u25b6" if i == sel else " "
+                    attr = curses.color_pair(2) | curses.A_BOLD if i == sel else curses.A_NORMAL
+                    self._safe(3 + i, 2, f" {arrow} {name}", attr)
+
+            bar = " Enter:Select  n:New library  Esc:Back "
+            self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
+
+            self.scr.refresh()
+            key = self.scr.getch()
+
+            if key == 27:  # Esc
+                break
+            elif key in (10, 13) and libs:
+                self.lib_name = libs[sel]
+                self.sel = 0
+                self._reload()
+                break
+            elif key in (curses.KEY_UP, ord('k')) and libs:
+                sel = (sel - 1) % len(libs)
+            elif key in (curses.KEY_DOWN, ord('j')) and libs:
+                sel = (sel + 1) % len(libs)
+            elif key == ord('n'):
+                self.scr.timeout(80)
+                name = self._input_dialog("New library name:")
+                self.scr.timeout(-1)
+                if name:
+                    sym_dir = LIB_DIR / "symbol"
+                    sym_dir.mkdir(parents=True, exist_ok=True)
+                    sym_file = sym_dir / f"{name}.kicad_sym"
+                    if not sym_file.exists():
+                        sym_file.write_text(
+                            f'(kicad_symbol_lib (version 20210201) (generator kicomp)\n)\n'
+                        )
+                    libs = discover_libraries()
+                    if name in libs:
+                        sel = libs.index(name)
+
+        self.scr.timeout(80)
+        self.scr.touchwin()
+
     # ── actions ──
 
     def _add(self):
+        if not self.lib_name:
+            self._flash("Select a library first (l)", err=True)
+            return
         lcsc = self._input_dialog("LCSC Part # (e.g. C17548754):")
         if not lcsc:
             return
@@ -559,7 +663,7 @@ class KiCompTUI:
         self.draw()
         curses.doupdate()
 
-        ok, out = run_jlc2kicad(lcsc)
+        ok, out = run_jlc2kicad(lcsc, self.lib_name)
         if ok:
             self._reload()
             for i, c in enumerate(self.components):
@@ -583,7 +687,7 @@ class KiCompTUI:
         self.draw()
         curses.doupdate()
 
-        ok, out = run_jlc2kicad(lcsc)
+        ok, out = run_jlc2kicad(lcsc, self.lib_name)
         if ok:
             self._reload()
             self._flash(f"Updated {comp['name']}")
@@ -599,10 +703,10 @@ class KiCompTUI:
             return False
 
     def _copy_symbol(self):
-        if not self.components:
+        if not self.components or not self.lib_name:
             return
         comp = self.components[self.sel]
-        ref = f"{SYMBOL_LIB}:{comp['name']}"
+        ref = f"{self.lib_name}:{comp['name']}"
         if self._clip(ref):
             self._flash(f"Copied: {ref}")
         else:
@@ -624,6 +728,9 @@ class KiCompTUI:
     # ── main loop ──
 
     def run(self):
+        if not self.lib_name:
+            self._library_menu()
+
         prev_sel = -1
         while True:
             if self.sel != prev_sel:
@@ -652,6 +759,9 @@ class KiCompTUI:
                 self._copy_symbol()
             elif key == ord('f'):
                 self._copy_footprint()
+            elif key == ord('l'):
+                self._library_menu()
+                prev_sel = -1
 
 
 # ── Entry point ────────────────────────────────────────────────
