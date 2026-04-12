@@ -26,19 +26,30 @@ from pathlib import Path
 
 # ── Configuration ──────────────────────────────────────────────
 
-PROJECT_DIR = Path.cwd()
-LIB_DIR = PROJECT_DIR / "lib"
-SYM_LIB_TABLE = PROJECT_DIR / "sym-lib-table"
-FP_LIB_TABLE = PROJECT_DIR / "fp-lib-table"
-
 SHADE = " .,:;=+*#%@"
+
+
+def _project_dir():
+    return Path.cwd()
+
+
+def _lib_dir():
+    return _project_dir() / "lib"
+
+
+def _sym_lib_table():
+    return _project_dir() / "sym-lib-table"
+
+
+def _fp_lib_table():
+    return _project_dir() / "fp-lib-table"
 
 
 # ── Library discovery ──────────────────────────────────────────
 
 def discover_libraries():
     """Return sorted list of library names found under lib/symbol/."""
-    sym_dir = LIB_DIR / "symbol"
+    sym_dir = _lib_dir() / "symbol"
     if not sym_dir.is_dir():
         return []
     return sorted(p.stem for p in sym_dir.glob("*.kicad_sym"))
@@ -95,23 +106,23 @@ def _remove_from_lib_table(path, entry_name):
 
 def is_lib_in_project(name):
     """Check if library's symbol file is referenced in sym-lib-table (by URI)."""
-    return _find_entry_by_uri(SYM_LIB_TABLE, _sym_uri_for(name)) is not None
+    return _find_entry_by_uri(_sym_lib_table(), _sym_uri_for(name)) is not None
 
 
 def toggle_lib_in_project(name):
     """Toggle library in/out of KiCad project tables. Returns new state."""
-    sym_entry = _find_entry_by_uri(SYM_LIB_TABLE, _sym_uri_for(name))
+    sym_entry = _find_entry_by_uri(_sym_lib_table(), _sym_uri_for(name))
     if sym_entry is not None:
-        _remove_from_lib_table(SYM_LIB_TABLE, sym_entry)
-        fp_entry = _find_entry_by_uri(FP_LIB_TABLE, _fp_uri_for(name))
+        _remove_from_lib_table(_sym_lib_table(), sym_entry)
+        fp_entry = _find_entry_by_uri(_fp_lib_table(), _fp_uri_for(name))
         if fp_entry is not None:
-            _remove_from_lib_table(FP_LIB_TABLE, fp_entry)
+            _remove_from_lib_table(_fp_lib_table(), fp_entry)
         return False
     else:
-        _add_to_lib_table(SYM_LIB_TABLE, 'sym_lib_table', name, _sym_uri_for(name))
-        fp_dir = LIB_DIR / name
+        _add_to_lib_table(_sym_lib_table(), 'sym_lib_table', name, _sym_uri_for(name))
+        fp_dir = _lib_dir() / name
         if fp_dir.is_dir():
-            _add_to_lib_table(FP_LIB_TABLE, 'fp_lib_table', name, _fp_uri_for(name))
+            _add_to_lib_table(_fp_lib_table(), 'fp_lib_table', name, _fp_uri_for(name))
         return True
 
 
@@ -119,8 +130,8 @@ def toggle_lib_in_project(name):
 
 def parse_components(lib_name):
     """Parse .kicad_sym for *lib_name* and return list of component dicts."""
-    sym_file = LIB_DIR / "symbol" / f"{lib_name}.kicad_sym"
-    fp_dir = LIB_DIR / lib_name
+    sym_file = _lib_dir() / "symbol" / f"{lib_name}.kicad_sym"
+    fp_dir = _lib_dir() / lib_name
     pkg_dir = fp_dir / "packages3d"
 
     if not sym_file.exists():
@@ -193,7 +204,7 @@ def find_wrl(component, lib_name):
     fp_name = fp.split(':')[1] if ':' in fp else fp
     if not fp_name:
         return None
-    path = LIB_DIR / lib_name / "packages3d" / f"{fp_name}.wrl"
+    path = _lib_dir() / lib_name / "packages3d" / f"{fp_name}.wrl"
     return path if path.exists() else None
 
 
@@ -374,7 +385,7 @@ def run_jlc2kicad(lcsc_code, lib_name):
     """Download/update a component.  Returns (ok, output_text)."""
     cmd = [
         'JLC2KiCadLib', lcsc_code,
-        '-dir', str(LIB_DIR),
+        '-dir', str(_lib_dir()),
         '-symbol_lib', lib_name,
         '-footprint_lib', lib_name,
         '-models', 'STEP', 'WRL',
@@ -717,7 +728,7 @@ class KiCompTUI:
                 name = self._input_dialog("New library name:")
                 self.scr.timeout(-1)
                 if name:
-                    sym_dir = LIB_DIR / "symbol"
+                    sym_dir = _lib_dir() / "symbol"
                     sym_dir.mkdir(parents=True, exist_ok=True)
                     sym_file = sym_dir / f"{name}.kicad_sym"
                     if not sym_file.exists():
