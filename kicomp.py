@@ -46,16 +46,25 @@ def discover_libraries():
 
 # ── KiCad project lib-table management ────────────────────────
 
-def _parse_lib_table(path):
-    """Return set of library names referenced in a sym-lib-table or fp-lib-table."""
+def _sym_uri_for(name):
+    return f'${{KIPRJMOD}}/lib/symbol/{name}.kicad_sym'
+
+
+def _fp_uri_for(name):
+    return f'${{KIPRJMOD}}/lib/{name}'
+
+
+def _find_entry_by_uri(path, uri):
+    """Find a lib entry by URI. Returns the name field if found, else None."""
     if not path.exists():
-        return set()
+        return None
     content = path.read_text()
-    return set(re.findall(r'\(lib\s+\(name\s+"([^"]+)"\)', content))
-
-
-def _lib_table_has(path, name):
-    return name in _parse_lib_table(path)
+    for m in re.finditer(
+        r'\(lib\s+\(name\s+"([^"]+)"\).*?\(uri\s+"([^"]+)"\)', content
+    ):
+        if m.group(2) == uri:
+            return m.group(1)
+    return None
 
 
 def _add_to_lib_table(path, tag, name, uri):
@@ -65,7 +74,6 @@ def _add_to_lib_table(path, tag, name, uri):
         path.write_text(f'({tag}\n  (version 7)\n{entry})\n')
         return
     content = path.read_text()
-    # Insert before closing paren
     idx = content.rfind(')')
     if idx == -1:
         return
@@ -73,38 +81,37 @@ def _add_to_lib_table(path, tag, name, uri):
     path.write_text(content)
 
 
-def _remove_from_lib_table(path, name):
-    """Remove a library entry from a lib-table file."""
+def _remove_from_lib_table(path, entry_name):
+    """Remove a library entry by its name field."""
     if not path.exists():
         return
     content = path.read_text()
-    # Remove the (lib (name "X")...) line
     content = re.sub(
-        r'\s*\(lib\s+\(name\s+"' + re.escape(name) + r'"\)[^)]*\)\)',
+        r'\s*\(lib\s+\(name\s+"' + re.escape(entry_name) + r'"\)[^)]*\)\)',
         '', content,
     )
     path.write_text(content)
 
 
 def is_lib_in_project(name):
-    """Check if library is referenced in both sym-lib-table and fp-lib-table."""
-    return _lib_table_has(SYM_LIB_TABLE, name)
+    """Check if library's symbol file is referenced in sym-lib-table (by URI)."""
+    return _find_entry_by_uri(SYM_LIB_TABLE, _sym_uri_for(name)) is not None
 
 
 def toggle_lib_in_project(name):
     """Toggle library in/out of KiCad project tables. Returns new state."""
-    active = is_lib_in_project(name)
-    if active:
-        _remove_from_lib_table(SYM_LIB_TABLE, name)
-        _remove_from_lib_table(FP_LIB_TABLE, name)
+    sym_entry = _find_entry_by_uri(SYM_LIB_TABLE, _sym_uri_for(name))
+    if sym_entry is not None:
+        _remove_from_lib_table(SYM_LIB_TABLE, sym_entry)
+        fp_entry = _find_entry_by_uri(FP_LIB_TABLE, _fp_uri_for(name))
+        if fp_entry is not None:
+            _remove_from_lib_table(FP_LIB_TABLE, fp_entry)
         return False
     else:
-        sym_uri = f'${{KIPRJMOD}}/lib/symbol/{name}.kicad_sym'
-        fp_uri = f'${{KIPRJMOD}}/lib/{name}'
-        _add_to_lib_table(SYM_LIB_TABLE, 'sym_lib_table', name, sym_uri)
+        _add_to_lib_table(SYM_LIB_TABLE, 'sym_lib_table', name, _sym_uri_for(name))
         fp_dir = LIB_DIR / name
         if fp_dir.is_dir():
-            _add_to_lib_table(FP_LIB_TABLE, 'fp_lib_table', name, fp_uri)
+            _add_to_lib_table(FP_LIB_TABLE, 'fp_lib_table', name, _fp_uri_for(name))
         return True
 
 
