@@ -26,7 +26,10 @@ from pathlib import Path
 
 # ── Configuration ──────────────────────────────────────────────
 
-LIB_DIR = Path.cwd() / "lib"
+PROJECT_DIR = Path.cwd()
+LIB_DIR = PROJECT_DIR / "lib"
+SYM_LIB_TABLE = PROJECT_DIR / "sym-lib-table"
+FP_LIB_TABLE = PROJECT_DIR / "fp-lib-table"
 
 SHADE = " .,:;=+*#%@"
 
@@ -39,6 +42,70 @@ def discover_libraries():
     if not sym_dir.is_dir():
         return []
     return sorted(p.stem for p in sym_dir.glob("*.kicad_sym"))
+
+
+# ── KiCad project lib-table management ────────────────────────
+
+def _parse_lib_table(path):
+    """Return set of library names referenced in a sym-lib-table or fp-lib-table."""
+    if not path.exists():
+        return set()
+    content = path.read_text()
+    return set(re.findall(r'\(lib\s+\(name\s+"([^"]+)"\)', content))
+
+
+def _lib_table_has(path, name):
+    return name in _parse_lib_table(path)
+
+
+def _add_to_lib_table(path, tag, name, uri):
+    """Add a library entry to a lib-table file, creating it if needed."""
+    entry = f'  (lib (name "{name}")(type "KiCad")(uri "{uri}")(options "")(descr ""))\n'
+    if not path.exists():
+        path.write_text(f'({tag}\n  (version 7)\n{entry})\n')
+        return
+    content = path.read_text()
+    # Insert before closing paren
+    idx = content.rfind(')')
+    if idx == -1:
+        return
+    content = content[:idx] + entry + content[idx:]
+    path.write_text(content)
+
+
+def _remove_from_lib_table(path, name):
+    """Remove a library entry from a lib-table file."""
+    if not path.exists():
+        return
+    content = path.read_text()
+    # Remove the (lib (name "X")...) line
+    content = re.sub(
+        r'\s*\(lib\s+\(name\s+"' + re.escape(name) + r'"\)[^)]*\)\)',
+        '', content,
+    )
+    path.write_text(content)
+
+
+def is_lib_in_project(name):
+    """Check if library is referenced in both sym-lib-table and fp-lib-table."""
+    return _lib_table_has(SYM_LIB_TABLE, name)
+
+
+def toggle_lib_in_project(name):
+    """Toggle library in/out of KiCad project tables. Returns new state."""
+    active = is_lib_in_project(name)
+    if active:
+        _remove_from_lib_table(SYM_LIB_TABLE, name)
+        _remove_from_lib_table(FP_LIB_TABLE, name)
+        return False
+    else:
+        sym_uri = f'${{KIPRJMOD}}/lib/symbol/{name}.kicad_sym'
+        fp_uri = f'${{KIPRJMOD}}/lib/{name}'
+        _add_to_lib_table(SYM_LIB_TABLE, 'sym_lib_table', name, sym_uri)
+        fp_dir = LIB_DIR / name
+        if fp_dir.is_dir():
+            _add_to_lib_table(FP_LIB_TABLE, 'fp_lib_table', name, fp_uri)
+        return True
 
 
 # ── Library Parsing ────────────────────────────────────────────
@@ -610,10 +677,11 @@ class KiCompTUI:
             else:
                 for i, name in enumerate(libs):
                     arrow = "\u25b6" if i == sel else " "
+                    check = "\u2713" if is_lib_in_project(name) else " "
                     attr = curses.color_pair(2) | curses.A_BOLD if i == sel else curses.A_NORMAL
-                    self._safe(3 + i, 2, f" {arrow} {name}", attr)
+                    self._safe(3 + i, 2, f" {arrow} [{check}] {name}", attr)
 
-            bar = " Enter:Select  n:New library  Esc:Back  q:Quit "
+            bar = " Enter:Select  t:Toggle in project  n:New  Esc:Back  q:Quit "
             self._safe(h - 2, 0, bar.center(w), curses.color_pair(4))
 
             self.scr.refresh()
@@ -635,6 +703,8 @@ class KiCompTUI:
                 sel = (sel - 1) % len(libs)
             elif key in (curses.KEY_DOWN, ord('j')) and libs:
                 sel = (sel + 1) % len(libs)
+            elif key == ord('t') and libs:
+                toggle_lib_in_project(libs[sel])
             elif key == ord('n'):
                 self.scr.timeout(80)
                 name = self._input_dialog("New library name:")
@@ -647,6 +717,8 @@ class KiCompTUI:
                         sym_file.write_text(
                             '(kicad_symbol_lib (version 20210201) (generator kicomp)\n)\n'
                         )
+                    if not is_lib_in_project(name):
+                        toggle_lib_in_project(name)
                     libs = discover_libraries()
                     if name in libs:
                         sel = libs.index(name)
